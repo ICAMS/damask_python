@@ -1,7 +1,7 @@
 # Kanapy Interface to DAMASK's Python API
-This repository is a mirror of the python module of DAMASK with additional subroutines to exchange data with [Kanapy](https://github.com/ICAMS/Kanapy.git), the ICAMS tools for microstructure generation.
+This repository is a fork of the python module of [DAMASK](https://github.com/damask-multiphysics/DAMASK) with additional subroutines to exchange data with [Kanapy](https://github.com/ICAMS/Kanapy.git), the ICAMS tool for microstructure generation.
 
-The following part of this documents represents the DAMASK README file:
+The following part of this document represents the [DAMASK](https://github.com/damask-multiphysics/DAMASK) README file:
 
 
 # DAMASK - The Düsseldorf Advanced Material Simulation Kit
