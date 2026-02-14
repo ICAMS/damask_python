@@ -399,14 +399,13 @@ class GeomGrid:
                        )
 
     @staticmethod
-    def load_kanapy(src: Union[str, Path, Mapping[str, Any]],
-                    keys: Dict[str, str] = None) -> 'GeomGrid':
+    def load_MiMedat(src: Union[str, Path, Mapping[str, Any]], keys: Dict[str, str] = None) -> 'GeomGrid':
         """
-        Read geometry from a Kanapy JSON **file path**, a **JSON string**, or a **dict**,
-        normalize lengths to micrometers (µm), and return a GeomGrid with:
+        Read geometry from a JSON file path according to MiMedat schema, a JSON string, or a dict,
+        normalize lengths to meters (m), and return a GeomGrid with:
           - material: int64 (Nx, Ny, Nz), Fortran-order (grain labels, 0..G-1; zeros if absent)
-          - size: axis lengths in µm (float[3])
-          - origin: in µm (float[3])
+          - size: axis lengths in m (float[3])
+          - origin: in m (float[3])
           - comments: execution stamp
 
         Expected JSON keys (customizable via `keys`):
@@ -417,17 +416,17 @@ class GeomGrid:
           - "units": {"Length": "<mm|m|um|µm|micron>"}
 
         Additionally (optional) for voxel→grain labels:
-          data["microstructure_evolution"][0]["grains"] : [{"grain_id": ...}, ...]
-          data["microstructure_evolution"][0]["voxels"] : [{"voxel_id": ..., "grain_id": ...}, ...]
-          - voxel_id may be 0..N-1 or 1..N (linearly indexed, C-order: z fastest, then y, then x)
+          data["microstructure"][0]["grains"] : [{"grain_id": ...}, ...]
+          data["microstructure"][0]["voxels"] : [{"voxel_id": ..., "grain_id": ...}, ...]
+          - voxel_id may be 1..N (linearly indexed, C-order: z fastest, then y, then x)
         """
 
-        def _length_unit_to_um_factor(u: str) -> float:
+        def _length_unit_to_m_factor(u: str) -> float:
             u = str(u).strip().lower()
-            if u in {"mm", "millimeter", "millimeters"}: return 1e3
-            if u in {"m", "meter", "meters"}:            return 1e6
-            if u in {"um", "µm", "micrometer", "micrometers", "micron", "microns"}: return 1.0
-            raise ValueError(f"Unsupported length unit for conversion to µm: '{u}'")
+            if u in {"mm", "millimeter", "millimeters"}: return 1e-3
+            if u in {"m", "meter", "meters"}:            return 1.0
+            if u in {"um", "µm", "micrometer", "micrometers", "micron", "microns"}: return 1e-6
+            raise ValueError(f"Unsupported length unit for conversion to m: '{u}'")
 
         if keys is None:
             keys = {
@@ -453,37 +452,42 @@ class GeomGrid:
             except json.JSONDecodeError as e:
                 raise ValueError(
                     "Input string could not be parsed as JSON and no file was found at the path."
-                    ) from e
+                ) from e
         elif isinstance(src, Mapping):
             data = dict(src)  # shallow copy to avoid mutating caller's dict
         else:
             raise TypeError(
                 "src must be a file path (str/Path), a JSON string, or a dict-like Mapping.")
 
-        # Convert Units → µm
+        # Convert Units → m
         units_dict = data.get(keys["units"], {})
-        length_unit = units_dict.get(keys["length"], "mm")
-        f_um = _length_unit_to_um_factor(length_unit)
+        length_unit = units_dict.get(keys["length"])
+        f_m = _length_unit_to_m_factor(length_unit)
 
-        size_um = np.asarray(data[keys["size"]], float) * f_um  # (3,)
-        spacing_um = np.asarray(data[keys["spacing"]], float) * f_um  # (3,)
-        origin_um = np.asarray(data.get(keys["origin"], [0.0, 0.0, 0.0]), float) * f_um
+        size_m = np.asarray(data[keys["size"]], float) * f_m  # (3,)
+        spacing_m = np.asarray(data[keys["spacing"]], float) * f_m  # (3,)
+        origin_raw = data.get(keys["origin"], [0.0, 0.0, 0.0])
+        # If origin is not a 3-vector (e.g., your provenance dict), fall back.
+        if not (isinstance(origin_raw, (list, tuple, np.ndarray)) and len(origin_raw) == 3):
+            origin_raw = [0.0, 0.0, 0.0]
+
+        origin_m = np.asarray(origin_raw, dtype=float) * f_m
         N_json = int(data[keys["count"]])
 
-        if size_um.shape != (3,) or spacing_um.shape != (3,) or origin_um.shape != (3,):
+        if size_m.shape != (3,) or spacing_m.shape != (3,) or origin_m.shape != (3,):
             raise ValueError("Expected 3 components for size, spacing, and origin.")
 
         # cells = size / spacing
-        cells_f = size_um / spacing_um
+        cells_f = size_m / spacing_m
         cells = np.rint(cells_f).astype(int)
 
         if not np.array_equal(cells_f, cells.astype(float)):
-            raise ValueError(f"Non-integer voxel counts from size/spacing (µm): {cells_f}")
+            raise ValueError(f"Non-integer voxel counts from size/spacing (m): {cells_f}")
         if np.any(cells <= 0):
             raise ValueError(f"Voxel counts must be positive, got {cells}.")
-        if not np.array_equal(size_um, spacing_um * cells):
+        if not np.array_equal(size_m, spacing_m * cells):
             raise ValueError(
-                f"size != spacing * cells (µm): size={size_um}, spacing*cells={spacing_um * cells}")
+                f"size != spacing * cells (µm): size={size_m}, spacing*cells={spacing_m * cells}")
 
         # cross-check total voxel count
         N_calc = int(np.prod(cells))
@@ -494,39 +498,41 @@ class GeomGrid:
         # -------------------------------------------------------------------------------
         # ADD: Build 'material' from voxel→grain mapping if available
         # Expected structure:
-        #   data["microstructure_evolution"][0]["grains"] : [{"grain_id": ...}, ...]
-        #   data["microstructure_evolution"][0]["voxels"] : [{"voxel_id": ..., "grain_id": ...}, ...]
+        #   data["microstructure"][0]["grains"] : [{"grain_id": ...}, ...]
+        #   data["microstructure"][0]["voxels"] : [{"voxel_id": ..., "grain_id": ...}, ...]
         # - 'voxel_id' is C-order linear index (z fastest, then y, then x), possibly 1-based
         # - 'grain_id' matches some 'grain_id' in grain level
         # Compact gid → 0..G-1 and fill a (Nx,Ny,Nz) array; ensure Fortran layout for DAMASK.
         # -------------------------------------------------------------------------------
 
         Nx, Ny, Nz = map(int, cells.tolist())
-        N = Nx * Ny * Nz # Total number of voxels
+        N = Nx * Ny * Nz  # Total number of voxels
         labels_3D_C = None
 
-        evo_list = data.get("microstructure_evolution")
-        if isinstance(evo_list, list) and len(evo_list) > 0 and isinstance(evo_list[0], dict):
-            evo0 = evo_list[0]
-            if ("voxels" in evo0) and ("grains" in evo0):
-                voxels = evo0["voxels"]
-                grains = evo0["grains"]
+        micro_list = data.get("microstructure")
+        if isinstance(micro_list, list) and len(micro_list) > 0 and isinstance(micro_list[0], dict):
+            micro0 = micro_list[0]
+            if ("voxels" in micro0) and ("grains" in micro0):
+                voxels = micro0["voxels"]
+                grains = micro0["grains"]
 
                 # Extract arrays
-                voxel_ids = np.fromiter((v["voxel_id"] for v in voxels), dtype=np.int64,count=len(voxels))
-                grain_ids = np.fromiter((v["grain_id"] for v in voxels), dtype=np.int64,count=len(voxels))
-                # 1) Count must match N
+                voxel_ids = np.fromiter((v["voxel_id"] for v in voxels), dtype=np.int64, count=len(voxels))
+                grain_ids = np.fromiter((v["grain_id"] for v in voxels), dtype=np.int64, count=len(voxels))
+                # 1) Count must match N (Total number of voxels)
                 if voxel_ids.size != N:
                     raise ValueError(f"'voxels' length ({voxel_ids.size}) must equal N={N}.")
 
                 # 2) voxel-ids must be unique
                 if np.unique(voxel_ids).size != N:
-                    raise ValueError("All 'vid' entries must be unique (found duplicates).")
+                    raise ValueError("All 'voxel-ids' entries must be unique (found duplicates).")
 
                 # 3) Determine indexing scheme (0-based vs 1-based) strictly
                 minv, maxv = int(voxel_ids.min()), int(voxel_ids.max())
-                if minv == 0 and maxv == N - 1: vids0 = voxel_ids      # 0-based
-                elif minv == 1 and maxv == N:   vids0 = voxel_ids - 1  # convert 1-based → 0-based
+                if minv == 0 and maxv == N - 1:
+                    vids0 = voxel_ids  # 0-based
+                elif minv == 1 and maxv == N:
+                    vids0 = voxel_ids - 1  # convert 1-based → 0-based
                 else:
                     raise ValueError(
                         f"'voxel_id' must cover either 0..{N - 1} or 1..{N}"
@@ -534,7 +540,7 @@ class GeomGrid:
                     )
 
                 # Grains IDs from grains list (already unique by definition)
-                gids = np.fromiter((g["grain_id"] for g in grains), dtype=np.int64,count=len(grains))
+                gids = np.fromiter((g["grain_id"] for g in grains), dtype=np.int64, count=len(grains))
 
                 # Verify voxel-referenced grain IDs match grains list exactly (as a set)
                 u_vox = np.unique(grain_ids)
@@ -555,19 +561,19 @@ class GeomGrid:
                 labels_C[vids0] = mapped  # use vids0 (already normalized 0-based voxel indices)
                 labels_3D_C = labels_C.reshape((Nx, Ny, Nz), order='C')
 
-        u = np.unique(mapped)
-        assert u.min() == 0 and u.max() == len(gids) - 1 and u.size == len(gids), \
-            f"Unexpected mapping: unique={u}, G={len(gids)}"
+                u = np.unique(mapped)
+                assert u.min() == 0 and u.max() == len(gids) - 1 and u.size == len(gids), \
+                    f"Unexpected mapping: unique={u}, G={len(gids)}"
 
         # Fallback: original behavior (all zeros) if voxel/grain mapping not present
         if labels_3D_C is None:
             labels_3D_C = np.zeros((Nx, Ny, Nz), dtype=np.int64, order='C')
 
-        return GeomGrid(material = np.array(labels_3D_C, dtype=np.int64, order='F'),
-                        size     = size_um,  # in µm
-                        origin   = origin_um,  # in µm
-                        comments = util.execution_stamp('GeomGrid', 'from_kanapy'),
-                       )
+        return GeomGrid(material=np.array(labels_3D_C, dtype=np.int64, order='F'),
+                        size=size_m,
+                        origin=origin_m,
+                        comments=util.execution_stamp('GeomGrid', 'from_kanapy'),
+                        )
 
 
     @staticmethod

@@ -154,21 +154,97 @@ class ConfigMaterial(YAML):
 
         return base_config.material_add(**constituent,homogenization='direct')
 
-
     @staticmethod
-    def load_kanapy(src: Union[str, Path, Mapping[str, Any]]) -> 'ConfigMaterial':
+    def load_MiMedat(src: Union[str, Path, Mapping[str, Any]], outputs: list) -> 'ConfigMaterial':
 
         """
-        Build a ConfigMaterial from a Kanapy-style JSON that contains:
-        - microstructure_evolution[0].grains[*].orientation  (Euler angles, radians)
-        - microstructure_evolution[0].grains[*].phase_id
-        - phases[*].phase_identifier (optional, to name phases)
+        Build a DAMASK ConfigMaterial from a JSON file path following the MiMedat schema.
 
-        `src` may be:
-          - a file path (str/Path),
-          - a raw JSON string,
-          - a dict-like Mapping (already-parsed JSON).
+        This function reads phase-level information from a Kanapy JSON file
+        (or a pre-loaded dict) that follows the microstructure-sensitive
+        mechanical metadata schema and constructs a `ConfigMaterial`
+        compatible with DAMASK. For each phase it:
+
+        - Maps the lattice structure (e.g. ``"cf"``/``"fcc"`` → ``"cF"``).
+        - Builds the mechanical description:
+          - Elastic law (e.g. Hooke) from ``constitutive_model.elastic_*``.
+          - Plastic law (e.g. phenopowerlaw) from
+            ``constitutive_model.plastic_parameters``.
+        - Extracts phase orientations from
+          ``phase["orientation"]["euler_angles"]`` (keys ``"Phi1"``,
+          ``"Phi"``, ``"Phi2"`` in radians).
+        - Converts Euler angles (Bunge ZXZ convention) to unit quaternions
+          via ``Rotation.from_Euler_angles(...).as_quaternion()``.
+        - Registers the phase orientations in the material container via
+          ``config_material.material_add(homogenization='direct',
+          phase=phase_key, O=O)``.
+
+        Parameters
+        ----------
+        src : str or pathlib.Path or Mapping[str, Any]
+            Source of the Kanapy-style data. One of:
+            - Path to a JSON file.
+            - Raw JSON string.
+            - A dict-like object containing the parsed JSON.
+        outputs : list of str
+            Mechanical output fields to be requested from DAMASK for each
+            phase, e.g. ``["F", "P", "F_p", "F_e", "L_p", "O"]``. These are
+            stored under ``config_material["phase"][phase_key]
+            ["mechanical"]["output"]``.
+
+        Returns
+        -------
+        ConfigMaterial
+            A fully populated material configuration object containing:
+            - The homogenization block under ``["homogenization"]["direct"]``.
+            - One phase entry under ``["phase"][phase_key]`` for each phase
+              in the input.
+            - One material entry per phase created via
+              ``material_add(..., O=O)``.
+
+        Raises
+        ------
+        TypeError
+            If ``src`` is not a path, string, or mapping.
+        ValueError
+            If ``src`` looks like a path/JSON string but cannot be parsed as
+            JSON, if Euler angles are missing or inconsistent, or if the
+            quaternion array has an invalid shape.
+
+        Notes
+        -----
+        Expected JSON structure for each phase is, schematically::
+
+            {
+              "phase_id": 0,
+              "material_identifier": "Iron",
+              "lattice_structure": "fcc",
+              "constitutive_model": {
+                "elastic_model_name": "hooke",
+                "elastic_parameters": {...},
+                "plastic_model_name": "phenopowerlaw",
+                "plastic_parameters": {...},
+                "units": {...}
+              },
+              "orientation": {
+                "euler_angles": {
+                  "Phi1": [...],
+                  "Phi":  [...],
+                  "Phi2": [...]
+                },
+                "grain_count": <int>,
+                ...
+              }
+            }
+
         """
+
+        # --------- container initialization ----------
+        config_material = ConfigMaterial()
+        config_material['homogenization']['direct'] = {
+            'N_constituents': 1,
+            'mechanical': {'type': 'pass'}
+        }
 
         # --------- accept path, JSON string, or dict ----------
         if isinstance(src, (str, Path)):
@@ -187,64 +263,122 @@ class ConfigMaterial(YAML):
             data = dict(src)  # shallow copy to avoid mutating caller's object
         else:
             raise TypeError(
-                "src must be a file path (str/Path), a JSON string, or a dict-like Mapping.")
+                "src must be a file path (str/Path), a JSON string, or a dict-like Mapping."
+            )
 
-        # --------- grains at time=0 ----------
-        evo = data.get("microstructure_evolution")
-        if not (isinstance(evo, list) and evo and isinstance(evo[0], dict)):
-            raise ValueError("JSON missing 'microstructure_evolution[0]' block.")
-        grains = evo[0].get("grains")
-        if not (isinstance(grains, list) and grains):
-            raise ValueError("JSON missing 'microstructure_evolution[0].grains' entries.")
+        # --------- extract phases and build DAMASK 'phase' block ----------
+        phases = data.get("phases", [])
 
-        # --------- Euler (rad) and phase_id ----------
-        try:
-            euler = np.asarray([g["orientation"] for g in grains], dtype=float)  # (Ng,3)
-        except KeyError as e:
-            raise ValueError(f"Grain entry missing 'orientation': {e}")
-        if euler.ndim != 2 or euler.shape[1] != 3:
-            raise ValueError(f"Expected Euler angles shape (Ng,3), got {euler.shape}.")
+        # map your lattice_structure → DAMASK lattice symbol
+        lattice_map = {
+            "fcc": "cF",
+            "bcc": "cI",
+            "hcp": "hP",
+        }
+        # Collect orientations + phase labels over ALL phases
+        all_O = []
+        all_phase_labels = []
+        for phase in phases:
+            phase_id = phase.get("phase_id")
+            phase_name = phase.get("phase_name")
+            phase_key = str(phase_name if phase_name is not None else phase_id)
 
-        try:
-            phase_ids = np.asarray([g["phase_id"] for g in grains], dtype=int)  # (Ng,)
-        except KeyError as e:
-            raise ValueError(f"Grain entry missing 'phase_id': {e}")
+            lattice_str = phase.get("lattice_structure")
+            lattice = lattice_map.get(lattice_str, lattice_str)
 
-        # --------- phase_id -> phase name (if available) ----------
-        phase_table = data.get("phases")
-        if isinstance(phase_table, list) and phase_table:
-            id_to_name = {}
-            for p in phase_table:
-                pid = p.get("id")
-                name = p.get("phase_identifier")
-                if pid is not None and name is not None:
-                    id_to_name[int(pid)] = str(name)
-            phase_labels = np.array(
-                [id_to_name.get(int(pid), str(int(pid))) for pid in phase_ids],
-                dtype=object,)
-        else:
-            phase_labels = phase_ids.astype(object)
+            constitutive = phase.get("constitutive_model", {})
+            elastic_model_name = constitutive.get("elastic_model_name")
+            plastic_model_name = constitutive.get("plastic_model_name")
+            elastic_parameters = constitutive.get("elastic_parameters", {})
+            plastic_parameters = constitutive.get("plastic_parameters", {})
 
-        # --------- Euler (rad) -> unit quaternions (Ng,4) ----------
-        O = Rotation.from_Euler_angles(euler).as_quaternion()
-        if O.ndim != 2 or O.shape[1] != 4 or not np.isfinite(O).all():
-            raise ValueError("Quaternion array O must be (Ng,4) and finite.")
+            # ensure nested dictionaries exist
+            phase_cfg = config_material.setdefault("phase", {}).setdefault(phase_key, {})
+            mech_cfg = phase_cfg.setdefault("mechanical", {})
 
-        # --------- base config ----------
-        unique_phases = np.unique(phase_labels)
-        phase_dict = {str(k): None for k in unique_phases.tolist()}
-        base_config = ConfigMaterial({
-            'homogenization': {
-                'direct': {
-                    'N_constituents': 1,
-                    'mechanical': {'type': 'pass'}
-                }},
-            'phase': phase_dict,
-        })
+            # lattice
+            phase_cfg["lattice"] = lattice
 
-        # --------- add one constituent per grain ----------
-        constituent = {'O': O, 'phase': phase_labels}
-        return base_config.material_add(**constituent, homogenization='direct')
+            # mechanical outputs (from function argument)
+            mech_cfg["output"] = list(outputs)
+
+            # elastic
+            C11 = elastic_parameters.get("C11")
+            C12 = elastic_parameters.get("C12")
+            C44 = elastic_parameters.get("C44")
+            elastic_type = elastic_model_name.capitalize() if elastic_model_name else None
+
+            mech_cfg["elastic"] = {
+                "type": elastic_type,  # e.g. "Hooke"
+                "C_11": C11,
+                "C_12": C12,
+                "C_44": C44,
+            }
+
+            # plastic
+            plast_cfg = mech_cfg.setdefault("plastic", {})
+            plast_cfg["type"] = plastic_model_name  # e.g. "phenopowerlaw"
+            for key, value in plastic_parameters.items():
+                plast_cfg[key] = value
+
+            # --------- orientation: Euler -> quaternion ----------
+            orientation = phase.get("orientation", {})
+            eulers = orientation.get("euler_angles", {})
+
+            phi1 = eulers.get("Phi1")
+            Phi = eulers.get("Phi")
+            phi2 = eulers.get("Phi2")
+
+            if phi1 is None or Phi is None or phi2 is None:
+                raise ValueError(
+                    f"Missing Euler angles for phase '{phase_key}'. "
+                    "Expected orientation.euler_angles with keys 'Phi1', 'Phi', 'Phi2'."
+                )
+            phi1 = np.asarray(phi1, dtype=float)
+            Phi = np.asarray(Phi, dtype=float)
+            phi2 = np.asarray(phi2, dtype=float)
+
+            if not (phi1.shape == Phi.shape == phi2.shape):
+                raise ValueError(
+                    f"Euler arrays for phase '{phase_key}' must have the same shape "
+                    f"(got Phi1={phi1.shape}, Phi={Phi.shape}, Phi2={phi2.shape})."
+                )
+
+            # Stack to (N, 3) for SciPy/DAMASK: Bunge ZXZ convention
+            euler_arr = np.vstack([phi1, Phi, phi2]).T  # shape (N, 3)
+
+            # --------- Euler (rad) -> unit quaternions (Ng,4) ----------
+            O = Rotation.from_Euler_angles(euler_arr).as_quaternion()
+            if O.ndim != 2 or O.shape[1] != 4 or not np.isfinite(O).all():
+                raise ValueError("Quaternion array O must be (Ng,4) and finite.")
+
+            # Optional consistency check with grain_count
+            grain_count = orientation.get("grain_count")
+            if grain_count is not None and grain_count != O.shape[0]:
+                raise ValueError(
+                    f"grain_count={grain_count} but {O.shape[0]} Euler orientations "
+                    f"found for phase '{phase_key}'."
+                )
+
+            # Collect for global material_add
+            all_O.append(O)
+            all_phase_labels.append(np.full(O.shape[0], phase_key, dtype=object))
+
+        if all_O:
+            O_all = np.vstack(all_O)  # (N_tot, 4)
+            phase_all = np.concatenate(all_phase_labels)  # (N_tot,)
+
+            constituent = {
+                "O": np.atleast_1d(O_all.squeeze()),
+                "phase": np.atleast_1d(phase_all.squeeze()),
+            }
+
+            config_material = config_material.material_add(
+                **constituent,
+                homogenization="direct",
+            )
+
+        return config_material
 
 
 

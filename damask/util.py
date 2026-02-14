@@ -15,7 +15,7 @@ from pathlib import Path as _Path
 import logging
 from typing import Optional as _Optional, Union as _Union, Iterable as _Iterable, \
                    Literal as _Literal, NamedTuple as _NamedTuple, \
-                   Any as _Any, TextIO as _TextIO, Generator as _Generator
+                   Any as _Any, TextIO as _TextIO, Generator as _Generator, Sequence as _Sequence
 
 import numpy as _np
 import h5py as _h5py
@@ -49,6 +49,144 @@ _colors = {
 ####################################################################################################
 # Functions
 ####################################################################################################
+def _build_loadsteps_from_mechanical_bc(
+        data: dict[str, _Any],
+        N_list: _Sequence[int],
+        f_out_list: _Sequence[int],
+        f_restart_list: _Sequence[int],) -> list[dict[str, _Any]]:
+    """
+    Build DAMASK-style loadsteps from a mechanical boundary condition
+    extracted from a JSON-like object.
+
+    Parameters
+    ----------
+    data : dict
+        Dictionary that must contain a key ``"mechanical_BC"`` with a list
+        of mechanical BC entries. From this list, the first entry that
+        satisfies:
+            - ``len(vertex_list) == 8`` (full cube → FFT/grid solver), and
+            - ``loading_type == "strain"``
+        is selected and converted to DAMASK loadsteps.
+
+        The selected entry is assumed to have:
+            - ``constraints`` : list[str] of length 3 (for x, y, z),
+              with values in ``{"loaded", "free", "fixed"}``.
+            - ``applied_load`` : list of dicts, each with:
+                * ``"magnitude"`` : dict with keys ``"xx"``, ``"yy"``, ``"zz"``
+                  giving total strain amplitudes for that step.
+                * ``"duration"`` : float, physical duration of that load step.
+                  This value is written to ``discretization["t"]``.
+
+    N_list, f_out_list, f_restart_list : sequence
+        Per-step values for number of increments, output frequency,
+        and restart frequency.
+
+    Returns
+    -------
+    loadsteps : list of dict
+        List of loadstep dictionaries in DAMASK grid format.
+    """
+    mechanical_BC = data.get("mechanical_BC", [])
+    if not mechanical_BC:
+        raise ValueError("No 'mechanical_BC' entry found in data.")
+
+    # --- pick the relevant BC: full cube + strain loading ---
+    bc_full_cube: _Optional[dict[str, _Any]] = None
+    for bc in mechanical_BC:
+        vertex_list = bc.get("vertex_list", [])
+        loading_type = bc.get("loading_type")
+        if len(vertex_list) == 8 and loading_type == "strain":
+            bc_full_cube = bc
+            break
+
+    if bc_full_cube is None:
+        raise ValueError(
+            "No mechanical_BC entry with 8 vertices and loading_type='strain' found."
+        )
+
+    constraints = bc_full_cube.get("constraints", [])
+    if len(constraints) != 3:
+        raise ValueError(
+            f"'constraints' must have length 3 for [x, y, z]; got {constraints}."
+        )
+
+    applied_load = bc_full_cube.get("applied_load", [])
+    if not applied_load:
+        raise ValueError("No 'applied_load' defined in mechanical_BC entry.")
+
+    num_steps = len(applied_load)
+
+    # --- check list lengths vs number of steps ---
+    if not (
+        len(N_list)
+        == len(f_out_list)
+        == len(f_restart_list)
+        == num_steps
+    ):
+        raise ValueError(
+            f"Length mismatch: num_steps={num_steps}, "
+            f"len(N_list)={len(N_list)}, "
+            f"len(f_out_list)={len(f_out_list)}, "
+            f"len(f_restart_list)={len(f_restart_list)}"
+        )
+
+    # map direction index -> magnitude key
+    idx_to_key = {0: "xx", 1: "yy", 2: "zz"}
+
+    loadsteps: list[dict[str, _Any]] = []
+
+    for i_step, load in enumerate(applied_load):
+        magnitude = load.get("magnitude", {})
+        duration = load.get("duration", None)
+        if duration is None or duration == 0:
+            raise ValueError(
+                f"Invalid 'duration' in applied_load[{i_step}]: {duration}"
+            )
+
+        # --- build dot_F for this step ---
+        dot_F: list[list[_Union[float, str]]] = [[0.0 for _ in range(3)] for _ in range(3)]
+
+        for idx_dir, c in enumerate(constraints):
+            key = idx_to_key[idx_dir]
+            value = magnitude.get(key, 0.0)
+
+            if c == "loaded":
+                # total strain / duration -> strain rate
+                dot_F[idx_dir][idx_dir] = float(value) / float(duration)
+            elif c == "free":
+                # let DAMASK decide → 'x' in dot_F
+                dot_F[idx_dir][idx_dir] = "x"
+            elif c == "fixed":
+                dot_F[idx_dir][idx_dir] = 0.0
+            else:
+                raise ValueError(
+                    f"Unknown constraint '{c}' in direction index {idx_dir}."
+                )
+
+        # --- build P:
+        # number in dot_F -> 'x' in P
+        # 'x' in dot_F    -> 0 in P
+        P: list[list[_Union[float, str]]] = [
+            [
+                0.0 if (isinstance(v, str) and v.strip().lower() == "x") else "x"
+                for v in row
+            ]
+            for row in dot_F
+        ]
+
+        loadsteps.append(
+            {
+                "boundary_conditions": {"mechanical": {"dot_F": dot_F, "P": P}},
+                "discretization": {
+                    "t": float(duration),  # <-- use duration here
+                    "N": int(N_list[i_step]),
+                },
+                "f_out": int(f_out_list[i_step]),
+                "f_restart": int(f_restart_list[i_step]),
+            }
+        )
+    return loadsteps
+
 def srepr(msg,
           glue: str = '\n',
           quote: bool = False) -> str:
