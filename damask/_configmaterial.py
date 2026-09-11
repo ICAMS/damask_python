@@ -1,4 +1,4 @@
-from typing import Optional, Union, Sequence, Tuple, List, Dict, Any, Mapping
+from typing import Optional, Union, Sequence, Any, Mapping
 from pathlib import Path
 
 import numpy as np
@@ -267,7 +267,12 @@ class ConfigMaterial(YAML):
             )
 
         # --------- extract phases and build DAMASK 'phase' block ----------
-        phases = data.get("phases", [])
+        phases = data.get("phase", [])
+        if not isinstance(phases, list) or len(phases) == 0:
+            raise ValueError(
+                "Missing or empty 'phase' block in MiMeDO data. "
+                "Expected data['phase'] to contain at least one phase."
+            )
 
         # map your lattice_structure → DAMASK lattice symbol
         lattice_map = {
@@ -379,7 +384,6 @@ class ConfigMaterial(YAML):
             )
 
         return config_material
-
 
 
     @staticmethod

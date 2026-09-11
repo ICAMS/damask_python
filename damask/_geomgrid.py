@@ -399,7 +399,8 @@ class GeomGrid:
                        )
 
     @staticmethod
-    def load_MiMedat(src: Union[str, Path, Mapping[str, Any]], keys: Dict[str, str] = None) -> 'GeomGrid':
+    def load_MiMedat(src: Union[str, Path, Mapping[str, Any]],
+                     keys: Dict[str, str] = None) -> 'GeomGrid':
         """
         Read geometry from a JSON file path according to MiMedat schema, a JSON string, or a dict,
         normalize lengths to meters (m), and return a GeomGrid with:
@@ -517,8 +518,10 @@ class GeomGrid:
                 grains = micro0["grains"]
 
                 # Extract arrays
-                voxel_ids = np.fromiter((v["voxel_id"] for v in voxels), dtype=np.int64, count=len(voxels))
-                grain_ids = np.fromiter((v["grain_id"] for v in voxels), dtype=np.int64, count=len(voxels))
+                voxel_ids = np.fromiter((v["voxel_id"] for v in voxels), dtype=np.int64,
+                                        count=len(voxels))
+                grain_ids = np.fromiter((v["grain_id"] for v in voxels), dtype=np.int64,
+                                        count=len(voxels))
                 # 1) Count must match N (Total number of voxels)
                 if voxel_ids.size != N:
                     raise ValueError(f"'voxels' length ({voxel_ids.size}) must equal N={N}.")
@@ -540,7 +543,8 @@ class GeomGrid:
                     )
 
                 # Grains IDs from grains list (already unique by definition)
-                gids = np.fromiter((g["grain_id"] for g in grains), dtype=np.int64, count=len(grains))
+                gids = np.fromiter((g["grain_id"] for g in grains), dtype=np.int64,
+                                   count=len(grains))
 
                 # Verify voxel-referenced grain IDs match grains list exactly (as a set)
                 u_vox = np.unique(grain_ids)
@@ -574,7 +578,6 @@ class GeomGrid:
                         origin=origin_m,
                         comments=util.execution_stamp('GeomGrid', 'from_kanapy'),
                         )
-
 
     @staticmethod
     def from_table(table: Table,

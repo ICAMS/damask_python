@@ -1,3 +1,4 @@
+import json
 import re
 import fnmatch
 import os
@@ -11,7 +12,6 @@ from collections.abc import Iterable
 from typing import Optional, Union, Callable, Any, Sequence, Literal, NamedTuple
 
 import h5py
-import json
 import numpy as np
 from numpy import ma
 from scipy import interpolate
@@ -2038,6 +2038,879 @@ class Result:
                 v.save(out_dir/f'{self.fname.stem}_inc{inc.split(prefix_inc)[-1].zfill(N_digits)}',
                        parallel=parallel)
 
+    def export_mimedo(
+        self,
+        json_path: Union[str, Path],
+        quantities: Sequence[str] = ("O", "F"),
+        *,
+        export_microstructure: Union[bool, str] = "voxels_only",
+        export_mechanical_response: bool = True,
+        stride: int = 1,
+        verbose: bool = True,
+    ) -> Path:
+        """
+        Export DAMASK results into a MiMeDat-style JSON data object.
+
+        This version preserves the old export behavior, but writes the final JSON
+        through a temporary file using streaming JSON output. This avoids building
+        one huge serialized JSON string in memory.
+
+        Mechanical response is written to top-level keys:
+            data_obj["stress"]
+            data_obj["total_strain"]
+            data_obj["plastic_strain"]
+
+        Microstructure snapshots are written as:
+            data_obj["microstructure"][0] = initial undeformed snapshot
+            data_obj["microstructure"][1:] = selected deformed DAMASK snapshots
+
+        Deformed snapshots do not receive an id.
+
+        export_microstructure='voxels_only' strips grain-level data ('grains' and
+        voxel 'grain_id') from the DEFORMED snapshots only, because the solver does
+        not update those fields. The initial undeformed snapshot always keeps its
+        grain data: it is the reference microstructure and the only source of grain
+        statistics and grain-ID coloring downstream.
+        """
+
+        import copy
+        import json
+        import warnings
+
+        # -------------------------------------------------------------------------
+        # Local message helper
+        # -------------------------------------------------------------------------
+        def _msg(s: str) -> None:
+            if verbose:
+                print(s)
+            else:
+                logger.info(s)
+
+        def _strip_grain_metadata(snapshot: dict[str, Any]) -> None:
+            snapshot.pop("grains", None)
+            for voxel in snapshot.get("voxels", []):
+                if isinstance(voxel, dict):
+                    voxel.pop("grain_id", None)
+
+        # -------------------------------------------------------------------------
+        # Normalize and validate microstructure export mode
+        # -------------------------------------------------------------------------
+        valid_microstructure_modes = (
+            False,
+            "voxels_only",
+            "voxels_with_grains",
+        )
+
+        if export_microstructure is True:
+            export_microstructure = "voxels_with_grains"
+
+        if export_microstructure not in valid_microstructure_modes:
+            raise ValueError(
+                "Invalid export_microstructure mode. "
+                "Allowed values are: False, 'voxels_only', or 'voxels_with_grains'. "
+                f"Got: {export_microstructure!r}"
+            )
+
+        export_microstructure_enabled = export_microstructure is not False
+
+        if export_microstructure == "voxels_with_grains":
+            warnings.warn(
+                "export_microstructure='voxels_with_grains' copies the initial grain "
+                "dictionary into deformed snapshots. These grain-level fields are not "
+                "updated by segmentation or grain-ID tracking. Use this mode only as "
+                "an intermediate export. For physically meaningful grain-level "
+                "evolution, post-process the result with grain segmentation and "
+                "grain-ID tracking.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # -------------------------------------------------------------------------
+        # Local generic helpers
+        # -------------------------------------------------------------------------
+        def _inc_index(name: str) -> int:
+            if not name.startswith(INC_PREFIX):
+                raise ValueError(f"Unexpected increment name: {name}")
+            return int(name[len(INC_PREFIX):])
+
+        def _sym(T: np.ndarray) -> np.ndarray:
+            return 0.5 * (T + T.T)
+
+        def _deviatoric(T: np.ndarray) -> np.ndarray:
+            T = _sym(np.asarray(T, dtype=float))
+            return T - np.trace(T) / 3.0 * np.eye(3)
+
+        def _mises_stress(T: np.ndarray) -> float:
+            s = _deviatoric(T)
+            return float(np.sqrt(1.5 * np.sum(s * s)))
+
+        def _mises_strain(E: np.ndarray) -> float:
+            e = _deviatoric(E)
+            return float(np.sqrt((2.0 / 3.0) * np.sum(e * e)))
+
+        def _tensor_components_6(
+            T: np.ndarray,
+        ) -> tuple[float, float, float, float, float, float]:
+            T = np.asarray(T, dtype=float)
+            return (
+                float(T[0, 0]),
+                float(T[1, 1]),
+                float(T[2, 2]),
+                float(T[0, 1]),
+                float(T[0, 2]),
+                float(T[1, 2]),
+            )
+
+        def _infer_n_voxels_from_mappings() -> int:
+            max_index = -1
+
+            for p in phases:
+                if p not in at_cell_ph[0]:
+                    raise KeyError(f"Phase '{p}' missing in at_cell mapping.")
+
+                at_cell = np.asarray(at_cell_ph[0][p], dtype=int)
+
+                if at_cell.size:
+                    max_index = max(max_index, int(np.max(at_cell)))
+
+            if max_index < 0:
+                raise ValueError("Could not infer number of voxels from DAMASK mappings.")
+
+            return max_index + 1
+
+        def _selected_microstructure_increments(inc_names: list[str]) -> list[str]:
+            if not inc_names:
+                return []
+
+            selected = inc_names[::stride]
+
+            if selected[-1] != inc_names[-1]:
+                selected.append(inc_names[-1])
+
+            return selected
+
+        def _median_spacing_along_axis(
+            centroids: np.ndarray,
+            axis: int,
+            Nx: int,
+            Ny: int,
+            Nz: int,
+        ) -> float:
+            if axis == 0:
+                coords = [
+                    centroids[(i - 1) + Nx * (0 + Ny * 0), 0]
+                    for i in range(1, Nx + 1)
+                ]
+
+            elif axis == 1:
+                coords = [
+                    centroids[0 + Nx * ((j - 1) + Ny * 0), 1]
+                    for j in range(1, Ny + 1)
+                ]
+
+            elif axis == 2:
+                coords = [
+                    centroids[0 + Nx * (0 + Ny * (k - 1)), 2]
+                    for k in range(1, Nz + 1)
+                ]
+
+            else:
+                raise ValueError(f"axis must be 0, 1, or 2, got {axis}")
+
+            coords = np.sort(np.asarray(coords, dtype=float))
+            diffs = np.diff(coords)
+            diffs = diffs[np.isfinite(diffs)]
+            diffs = diffs[diffs > 0.0]
+
+            return float(np.median(diffs)) if diffs.size else float("nan")
+
+        def _read_phase_tensor_field(
+            h5_file: h5py.File,
+            inc: str,
+            dataset_name: str,
+            n_voxels_full: int,
+        ) -> np.ndarray:
+            field_all = np.empty((n_voxels_full, 3, 3), dtype=float)
+
+            for p in phases:
+                if p not in at_cell_ph[0] or p not in in_data_ph[0]:
+                    raise KeyError(f"Phase '{p}' missing in mapping tables.")
+
+                at_cell = at_cell_ph[0][p]
+                in_data = in_data_ph[0][p]
+
+                path = f"{inc}/phase/{p}/mechanical/{dataset_name}"
+
+                if path not in h5_file:
+                    raise KeyError(
+                        f"Missing dataset '{path}'. "
+                        "Make sure the required DAMASK Result.add_* method was called "
+                        "before export_mimedo."
+                    )
+
+                compact = np.asarray(h5_file[path], dtype=float)
+
+                if compact.ndim != 3 or compact.shape[1:] != (3, 3):
+                    raise ValueError(
+                        f"{path}: expected tensor field shape (n, 3, 3), "
+                        f"got {compact.shape}"
+                    )
+
+                field_all[at_cell, :, :] = compact[in_data, :, :]
+
+            return field_all
+
+        # -------------------------------------------------------------------------
+        # Mechanical response exporter
+        # -------------------------------------------------------------------------
+        def _export_homogenized_response(
+            data_obj: dict[str, Any],
+            response_inc_names: list[str],
+            h5_file: h5py.File,
+            n_voxels_full: int,
+        ) -> None:
+            stress = {
+                "equivalent_stress": [],
+                "stress_11": [],
+                "stress_22": [],
+                "stress_33": [],
+                "stress_12": [],
+                "stress_13": [],
+                "stress_23": [],
+            }
+
+            total_strain = {
+                "equivalent_strain": [],
+                "strain_11": [],
+                "strain_22": [],
+                "strain_33": [],
+                "strain_12": [],
+                "strain_13": [],
+                "strain_23": [],
+            }
+
+            plastic_strain = {
+                "equivalent_plastic_strain": [],
+                "plastic_strain_11": [],
+                "plastic_strain_22": [],
+                "plastic_strain_33": [],
+                "plastic_strain_12": [],
+                "plastic_strain_13": [],
+                "plastic_strain_23": [],
+            }
+
+            _msg("\n[INFO] Exporting homogenized mechanical response...")
+            _msg(f"[INFO] Mechanical response increments: {len(response_inc_names)}")
+
+            for inc in util.show_progress(response_inc_names):
+                sigma_all = _read_phase_tensor_field(
+                    h5_file=h5_file,
+                    inc=inc,
+                    dataset_name="sigma",
+                    n_voxels_full=n_voxels_full,
+                )
+
+                eps_all = _read_phase_tensor_field(
+                    h5_file=h5_file,
+                    inc=inc,
+                    dataset_name="epsilon_V^0.0(F)",
+                    n_voxels_full=n_voxels_full,
+                )
+
+                eps_p_all = _read_phase_tensor_field(
+                    h5_file=h5_file,
+                    inc=inc,
+                    dataset_name="epsilon_U^0.0(F_p)",
+                    n_voxels_full=n_voxels_full,
+                )
+
+                sigma_macro = np.mean(sigma_all, axis=0)
+                eps_macro = np.mean(eps_all, axis=0)
+                eps_p_macro = np.mean(eps_p_all, axis=0)
+
+                # DAMASK stress is expected in Pa in this workflow, and the
+                # MiMeDat units block declares stress in Pa. Keep homogenized
+                # response stresses in Pa.
+                s11, s22, s33, s12, s13, s23 = _tensor_components_6(sigma_macro)
+                e11, e22, e33, e12, e13, e23 = _tensor_components_6(eps_macro)
+                ep11, ep22, ep33, ep12, ep13, ep23 = _tensor_components_6(eps_p_macro)
+
+                stress["stress_11"].append(s11)
+                stress["stress_22"].append(s22)
+                stress["stress_33"].append(s33)
+                stress["stress_12"].append(s12)
+                stress["stress_13"].append(s13)
+                stress["stress_23"].append(s23)
+                stress["equivalent_stress"].append(_mises_stress(sigma_macro))
+
+                total_strain["strain_11"].append(e11)
+                total_strain["strain_22"].append(e22)
+                total_strain["strain_33"].append(e33)
+                total_strain["strain_12"].append(e12)
+                total_strain["strain_13"].append(e13)
+                total_strain["strain_23"].append(e23)
+                total_strain["equivalent_strain"].append(_mises_strain(eps_macro))
+
+                plastic_strain["plastic_strain_11"].append(ep11)
+                plastic_strain["plastic_strain_22"].append(ep22)
+                plastic_strain["plastic_strain_33"].append(ep33)
+                plastic_strain["plastic_strain_12"].append(ep12)
+                plastic_strain["plastic_strain_13"].append(ep13)
+                plastic_strain["plastic_strain_23"].append(ep23)
+                plastic_strain["equivalent_plastic_strain"].append(_mises_strain(eps_p_macro))
+
+            data_obj.pop("time", None)
+
+            data_obj["stress"] = stress
+            data_obj["total_strain"] = total_strain
+            data_obj["plastic_strain"] = plastic_strain
+
+            _msg("[OK] Homogenized mechanical response exported.")
+            _msg("[OK] Top-level time was not exported.")
+
+        # -------------------------------------------------------------------------
+        # Microstructure snapshot preparation and validation
+        # -------------------------------------------------------------------------
+        def _prepare_microstructure_base(
+            data_obj: dict[str, Any],
+        ) -> tuple[dict[str, Any], int, int, int, int]:
+            microstructure_series = data_obj.get("microstructure")
+
+            if not isinstance(microstructure_series, list) or not microstructure_series:
+                raise ValueError(
+                    "JSON missing non-empty 'microstructure' list "
+                    "(expected microstructure[0])."
+                )
+
+            if len(microstructure_series) != 1:
+                raise RuntimeError(
+                    f"export_mimedo expects exactly ONE initial microstructure snapshot "
+                    f"when microstructure export is enabled.\n"
+                    f"Found {len(microstructure_series)} snapshots instead.\n"
+                    f"Please clean/reset the JSON file before running microstructure export."
+                )
+
+            base_snapshot = microstructure_series[0]
+
+            grid_meta = base_snapshot.get("grid")
+
+            if not isinstance(grid_meta, dict):
+                raise ValueError("JSON missing 'microstructure[0].grid' object.")
+
+            grid_status = str(grid_meta.get("status", "unknown")).lower()
+            _msg(f"[INFO] Initial grid status: '{grid_status}'")
+
+            if grid_status != "undeformed":
+                raise ValueError(
+                    f"Expected initial grid status 'undeformed', got '{grid_status}'."
+                )
+
+            if "microstructure_state_id" not in base_snapshot or not base_snapshot["microstructure_state_id"]:
+                raise ValueError(
+                    "Initial undeformed microstructure snapshot is missing an id. "
+                    "Expected data_obj['microstructure'][0]['microstructure_state_id']."
+                )
+
+            try:
+                grid_size0 = np.asarray(grid_meta["grid_size"], dtype=float)
+                grid_spacing0 = np.asarray(grid_meta["grid_spacing"], dtype=float)
+            except KeyError as e:
+                raise KeyError(
+                    "JSON missing 'microstructure[0].grid.grid_size' or "
+                    "'microstructure[0].grid.grid_spacing'."
+                ) from e
+
+            cell_counts_f = grid_size0 / grid_spacing0
+            cell_counts = np.rint(cell_counts_f).astype(int)
+
+            if not np.allclose(cell_counts_f, cell_counts, atol=0.0, rtol=0.0):
+                raise ValueError(
+                    f"Non-integer voxel counts from grid_size/grid_spacing: {cell_counts_f}"
+                )
+
+            Nx, Ny, Nz = map(int, cell_counts.tolist())
+            n_voxels = int(Nx * Ny * Nz)
+
+            voxel_list0 = base_snapshot.get("voxels")
+
+            if not isinstance(voxel_list0, list) or not voxel_list0:
+                raise ValueError("JSON missing 'microstructure[0].voxels' list.")
+
+            if len(voxel_list0) != n_voxels:
+                raise ValueError(
+                    f"Voxel count mismatch: len(voxels)={len(voxel_list0)} "
+                    f"vs Nx*Ny*Nz={n_voxels}"
+                )
+
+            _msg("[OK] JSON initial microstructure snapshot is valid.")
+
+            return base_snapshot, Nx, Ny, Nz, n_voxels
+
+        # -------------------------------------------------------------------------
+        # Microstructure snapshot generator
+        # -------------------------------------------------------------------------
+        def _iter_microstructure_snapshots(
+            base_snapshot: dict[str, Any],
+            microstructure_inc_names: list[str],
+            h5_file: h5py.File,
+            Nx: int,
+            Ny: int,
+            Nz: int,
+            n_voxels: int,
+        ):
+            """
+            Yield deformed microstructure snapshots one at a time.
+
+            This replaces the old behavior of appending every snapshot to
+            data_obj["microstructure"] in memory.
+            """
+            want_O = "O" in quantities
+            want_F = "F" in quantities
+            wanted_other = [q for q in quantities if q not in ("O", "F")]
+
+            _msg("\n[INFO] Exporting microstructure snapshots...")
+            _msg(f"[INFO] Microstructure mode: {export_microstructure}")
+            _msg(f"[INFO] Microstructure increments selected: {len(microstructure_inc_names)}")
+            _msg(f"[INFO] Microstructure stride: {stride}")
+            _msg(f"[INFO] Microstructure quantities: {quantities}")
+
+            for step_idx, inc in enumerate(
+                util.show_progress(microstructure_inc_names),
+                start=1,
+            ):
+                inc_idx = _inc_index(inc)
+                t_inc = float(self._times[inc_idx])
+
+                path_u = f"{inc}/geometry/u_p"
+
+                if path_u not in h5_file:
+                    raise KeyError(f"Missing dataset '{path_u}'")
+
+                U = np.asarray(h5_file[path_u], dtype=float)
+
+                if U.shape != (n_voxels, 3):
+                    raise ValueError(
+                        f"{inc}: geometry/u_p shape {U.shape} != {(n_voxels, 3)}"
+                    )
+
+                euler_all = np.empty((n_voxels, 3), dtype=float) if want_O else None
+                F_all = np.empty((n_voxels, 3, 3), dtype=float) if want_F else None
+                J_all = np.empty((n_voxels,), dtype=float) if want_F else None
+
+                other_all: dict[str, Any] = {q: None for q in wanted_other}
+
+                for p in phases:
+                    if p not in at_cell_ph[0] or p not in in_data_ph[0]:
+                        raise KeyError(
+                            f"Phase '{p}' missing in mapping tables "
+                            "(at_cell/in_data)."
+                        )
+
+                    at_cell = at_cell_ph[0][p]
+                    in_data = in_data_ph[0][p]
+
+                    if want_O:
+                        path_O = f"{inc}/phase/{p}/mechanical/O"
+
+                        if path_O not in h5_file:
+                            raise KeyError(f"Missing dataset '{path_O}'")
+
+                        O_compact = np.asarray(h5_file[path_O], dtype=float)
+
+                        if O_compact.ndim != 2 or O_compact.shape[1] != 4:
+                            raise ValueError(
+                                f"{path_O}: expected quaternion array shape (n, 4), "
+                                f"got {O_compact.shape}"
+                            )
+
+                        euler_all[at_cell, :] = (
+                            damask.Rotation.from_quaternion(
+                                O_compact[in_data, :]
+                            ).as_Euler_angles(degrees=False)
+                        )
+
+                    if want_F:
+                        path_F = f"{inc}/phase/{p}/mechanical/F"
+
+                        if path_F not in h5_file:
+                            raise KeyError(f"Missing dataset '{path_F}'")
+
+                        F_compact = np.asarray(h5_file[path_F], dtype=float)
+
+                        if F_compact.ndim != 3 or F_compact.shape[1:] != (3, 3):
+                            raise ValueError(
+                                f"{path_F}: expected tensor array shape (n, 3, 3), "
+                                f"got {F_compact.shape}"
+                            )
+
+                        F_all[at_cell, :, :] = F_compact[in_data, :, :]
+                        J_all[at_cell] = np.linalg.det(F_compact[in_data, :, :])
+
+                    for q in wanted_other:
+                        path_q = f"{inc}/phase/{p}/mechanical/{q}"
+
+                        if path_q not in h5_file:
+                            raise KeyError(f"Missing dataset '{path_q}'")
+
+                        q_compact = np.asarray(h5_file[path_q], dtype=float)
+                        q_phase = q_compact[in_data, ...]
+
+                        if other_all[q] is None:
+                            other_all[q] = np.empty(
+                                (n_voxels,) + q_phase.shape[1:],
+                                dtype=float,
+                            )
+
+                        other_all[q][at_cell, ...] = q_phase
+
+                snap = copy.deepcopy(base_snapshot)
+                snap["time_point"] = t_inc
+                snap.setdefault("grid", {})
+                snap["grid"]["status"] = "deformed"
+
+                # Deformed DAMASK snapshots are process states, not reusable
+                # undeformed input states.
+                snap.pop("microstructure_state_id", None)
+
+                if export_microstructure == "voxels_only":
+                    _strip_grain_metadata(snap)
+
+                voxels = snap["voxels"]
+                centroids = np.empty((n_voxels, 3), dtype=float)
+
+                for v in voxels:
+                    i, j, k = v["voxel_index"]
+                    L = (i - 1) + Nx * ((j - 1) + Ny * (k - 1))
+
+                    c0 = np.asarray(
+                        v.get("centroid_coordinates", [0.0, 0.0, 0.0]),
+                        dtype=float,
+                    )
+
+                    c_def = c0 + U[L]
+                    v["centroid_coordinates"] = c_def.tolist()
+                    centroids[L, :] = c_def
+
+                    if want_O:
+                        v[qmap["O"]] = euler_all[L].tolist()
+
+                    if want_F:
+                        v[qmap["F"]] = F_all[L].tolist()
+
+                        V0 = float(v.get("voxel_volume", 0.0))
+                        J_L = float(J_all[L])
+
+                        if J_L < 0.0 and J_L > -1.0e-10:
+                            J_L = 0.0
+
+                        v["voxel_volume"] = V0 * J_L
+
+                    for q in wanted_other:
+                        v[qmap[q]] = np.asarray(other_all[q][L, ...]).tolist()
+
+                cmin = centroids.min(axis=0)
+                cmax = centroids.max(axis=0)
+                grid_size_def = cmax - cmin
+
+                dx = _median_spacing_along_axis(centroids, 0, Nx, Ny, Nz)
+                dy = _median_spacing_along_axis(centroids, 1, Nx, Ny, Nz)
+                dz = _median_spacing_along_axis(centroids, 2, Nx, Ny, Nz)
+
+                grid_spacing_def = np.array([dx, dy, dz], dtype=float)
+
+                if np.any(~np.isfinite(grid_spacing_def)):
+                    raise ValueError(
+                        f"{inc}: grid_spacing estimate produced NaN/inf: "
+                        f"{grid_spacing_def}"
+                    )
+
+                snap["grid"]["grid_size"] = grid_size_def.tolist()
+                snap["grid"]["grid_spacing"] = grid_spacing_def.tolist()
+
+                if (
+                    step_idx in (1, 2)
+                    or step_idx == len(microstructure_inc_names)
+                    or (step_idx % 20 == 0)
+                ):
+                    _msg(
+                        f"[INFO] {inc:>12} | t={t_inc:.6g} | "
+                        f"grid_size={grid_size_def} | "
+                        f"grid_spacing={grid_spacing_def}"
+                    )
+
+                yield inc, snap
+
+            _msg("[OK] Microstructure snapshots generated.")
+
+        # -------------------------------------------------------------------------
+        # Streaming JSON writer
+        # -------------------------------------------------------------------------
+        def _json_dump_compact(obj: Any, fp) -> None:
+            json.dump(
+                obj,
+                fp,
+                indent=None,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+
+        def _write_key_prefix(fp, key: str, first_key: bool) -> bool:
+            if not first_key:
+                fp.write(",\n")
+            _json_dump_compact(str(key), fp)
+            fp.write(":")
+            return False
+
+        def _atomic_stream_write_mimedo(
+            data_obj: dict[str, Any],
+            json_path: Path,
+            *,
+            h5_file: h5py.File | None,
+            base_snapshot: dict[str, Any] | None,
+            microstructure_inc_names: list[str],
+            Nx: int | None,
+            Ny: int | None,
+            Nz: int | None,
+            n_voxels: int | None,
+        ) -> None:
+            tmp_path = json_path.with_suffix(json_path.suffix + ".tmp")
+
+            _msg(f"\n[INFO] Streaming updated MiMeDat JSON to temporary file: {tmp_path}")
+
+            try:
+                with tmp_path.open("w", encoding="utf-8") as fp:
+                    fp.write("{\n")
+                    first_key = True
+                    microstructure_written = False
+                    streamed_deformed_count = 0
+
+                    for key, value in data_obj.items():
+                        if key == "microstructure" and export_microstructure_enabled:
+                            if h5_file is None:
+                                raise RuntimeError(
+                                    "Internal error: h5_file is required for streaming "
+                                    "microstructure export."
+                                )
+                            if base_snapshot is None:
+                                raise RuntimeError(
+                                    "Internal error: base_snapshot is required for "
+                                    "streaming microstructure export."
+                                )
+                            if Nx is None or Ny is None or Nz is None or n_voxels is None:
+                                raise RuntimeError(
+                                    "Internal error: grid dimensions are required for "
+                                    "streaming microstructure export."
+                                )
+
+                            first_key = _write_key_prefix(fp, "microstructure", first_key)
+                            fp.write("[\n")
+
+                            # Initial undeformed snapshot.
+                            #
+                            # 'voxels_only' governs what is PROPAGATED into the
+                            # deformed snapshots (see _iter_microstructure_snapshots),
+                            # because grain-level fields are not updated by the solver.
+                            # The initial snapshot IS the reference microstructure, so
+                            # its grain data is valid and must be kept: it is the only
+                            # source of 'grains' and voxel 'grain_id' for grain
+                            # statistics and grain-ID coloring.
+                            _json_dump_compact(base_snapshot, fp)
+
+                            for local_idx, (inc, snap) in enumerate(
+                                _iter_microstructure_snapshots(
+                                    base_snapshot=base_snapshot,
+                                    microstructure_inc_names=microstructure_inc_names,
+                                    h5_file=h5_file,
+                                    Nx=Nx,
+                                    Ny=Ny,
+                                    Nz=Nz,
+                                    n_voxels=n_voxels,
+                                ),
+                                start=1,
+                            ):
+                                fp.write(",\n")
+                                _json_dump_compact(snap, fp)
+                                streamed_deformed_count += 1
+
+                                _msg(
+                                    f"[INFO] Wrote microstructure snapshot {inc} "
+                                    f"({local_idx}/{len(microstructure_inc_names)})"
+                                )
+
+                            fp.write("\n]")
+                            microstructure_written = True
+
+                        else:
+                            first_key = _write_key_prefix(fp, str(key), first_key)
+                            _json_dump_compact(value, fp)
+
+                    if export_microstructure_enabled and not microstructure_written:
+                        raise RuntimeError(
+                            "Internal error: export_microstructure is enabled but the "
+                            "'microstructure' key was not written."
+                        )
+
+                    fp.write("\n}\n")
+
+                tmp_path.replace(json_path)
+
+                _msg(f"[OK] JSON written atomically: {json_path.resolve()}")
+                _msg(f"[INFO] JSON file size: {json_path.stat().st_size / 1e6:.2f} MB")
+                if export_microstructure_enabled:
+                    _msg(
+                        "[OK] Microstructure snapshots exported to JSON: "
+                        f"1 initial + {streamed_deformed_count} deformed"
+                    )
+
+            except Exception:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except Exception:
+                    pass
+                raise
+
+        # =========================================================================
+        # Main function body starts here
+        # =========================================================================
+
+        INC_PREFIX = "increment_"
+        json_path = Path(json_path)
+
+        if not export_microstructure_enabled and not export_mechanical_response:
+            raise ValueError(
+                "At least one export branch must be enabled: "
+                "export_microstructure must not be False and/or "
+                "export_mechanical_response=True."
+            )
+
+        if not json_path.exists():
+            raise FileNotFoundError(f"JSON file not found: {json_path}")
+
+        if not self.fname.exists():
+            raise FileNotFoundError(f"HDF5 file not found: {self.fname}")
+
+        if not self.structured:
+            raise NotImplementedError(
+                "export_mimedo is implemented only for structured DAMASK grids."
+            )
+
+        if self.N_constituents != 1:
+            raise NotImplementedError(
+                "export_mimedo currently supports only one constituent "
+                "(N_constituents == 1)."
+            )
+
+        if stride < 1:
+            raise ValueError(f"stride must be >= 1, got {stride}")
+
+        qmap = {
+            "O": "orientation",
+            "F": "deformation_gradient",
+            "F_e": "elastic_deformation_gradient",
+            "F_p": "plastic_deformation_gradient",
+            "IPFcolor_(1 0 0)": "inverse_pole_figure_colors_100",
+            "L_p": "plastic_velocity_gradient",
+            "P": "first_piola_kirchhoff_stress",
+            "epsilon_V^0.0(F)": "strain",
+            "epsilon_V^0.0(F)_vM": "mises_equivalent_strain",
+            "epsilon_U^0.0(F_p)": "plastic_strain",
+            "epsilon_U^0.0(F_p)_vM": "mises_equivalent_plastic_strain",
+            "sigma": "stress",
+            "sigma_vM": "mises_equivalent_stress",
+            "xi_sl": "resistance_against_plastic_slip",
+        }
+
+        quantities = list(quantities)
+        unknown = [q for q in quantities if q not in qmap]
+
+        if unknown:
+            raise KeyError(
+                f"Unknown microstructure quantities requested: {unknown}. "
+                f"Allowed: {sorted(qmap.keys())}"
+            )
+
+        _msg("\n" + "=" * 90)
+        _msg("[INFO] export_mimedo: DAMASK HDF5 -> MiMeDat JSON")
+        _msg(f"[INFO] JSON: {json_path.resolve()}")
+        _msg(f"[INFO] HDF5: {self.fname.resolve()}")
+        _msg(f"[INFO] export_microstructure: {export_microstructure}")
+        _msg(f"[INFO] export_mechanical_response: {export_mechanical_response}")
+        _msg(f"[INFO] Microstructure quantities: {quantities}")
+        _msg(f"[INFO] Microstructure stride: {stride}")
+        _msg("=" * 90)
+
+        _msg("\n[INFO] Reading JSON...")
+        data_obj = json.loads(json_path.read_text())
+
+        # Remove stale top-level time if it exists from a previous exporter version.
+        data_obj.pop("time", None)
+
+        at_cell_ph, in_data_ph, _, _ = self._mappings()
+        phases = list(self._phases)
+        _msg(f"[INFO] Phases: {phases}")
+
+        all_inc_names = sorted(
+            [
+                inc for inc in self._increments
+                if _inc_index(inc) >= 0
+            ],
+            key=_inc_index,
+        )
+
+        nonzero_inc_names = [
+            inc for inc in all_inc_names
+            if _inc_index(inc) >= 1
+        ]
+
+        response_inc_names = all_inc_names
+        microstructure_inc_names = _selected_microstructure_increments(nonzero_inc_names)
+
+        _msg(f"[INFO] Available saved increments including increment_0: {len(all_inc_names)}")
+        _msg(f"[INFO] Available nonzero increments: {len(nonzero_inc_names)}")
+        _msg(f"[INFO] Mechanical response increments: {len(response_inc_names)}")
+        _msg(f"[INFO] Microstructure snapshot increments: {len(microstructure_inc_names)}")
+
+        base_snapshot = None
+        Nx = Ny = Nz = None
+        n_voxels_micro = None
+
+        if export_microstructure_enabled:
+            base_snapshot, Nx, Ny, Nz, n_voxels_micro = _prepare_microstructure_base(data_obj)
+
+        n_voxels_response = _infer_n_voxels_from_mappings()
+
+        if export_microstructure_enabled and n_voxels_micro != n_voxels_response:
+            raise ValueError(
+                f"Voxel count mismatch between JSON and DAMASK mappings: "
+                f"JSON={n_voxels_micro}, DAMASK mappings={n_voxels_response}"
+            )
+
+        with h5py.File(self.fname, "r") as f:
+            if export_mechanical_response:
+                _export_homogenized_response(
+                    data_obj=data_obj,
+                    response_inc_names=response_inc_names,
+                    h5_file=f,
+                    n_voxels_full=n_voxels_response,
+                )
+
+            _atomic_stream_write_mimedo(
+                data_obj=data_obj,
+                json_path=json_path,
+                h5_file=f if export_microstructure_enabled else None,
+                base_snapshot=base_snapshot,
+                microstructure_inc_names=microstructure_inc_names,
+                Nx=Nx,
+                Ny=Ny,
+                Nz=Nz,
+                n_voxels=n_voxels_micro,
+            )
+
+        _msg("[DONE] export_mimedo finished.")
+        _msg("=" * 90)
+
+        return json_path
 
     def export_DREAM3D(self,
                        q: str = 'O',
@@ -2166,296 +3039,6 @@ class Result:
                     for name,value in zip(names,values):
                         add_attribute(geom,name,value)
 
-    def export_MiMedat(self,
-        json_path: Union[str, Path],
-        quantities: Sequence[str] = ("O", "F"),
-        *,
-        verbose: bool = True,) -> Path:
-        """
-        Export selected voxel-resolved DAMASK results from this Result (HDF5) into a
-        MiMedat-style JSON microstructure time series.
-
-        The JSON file must contain exactly one microstructure snapshot (the initial,
-        undeformed state). This function appends one new snapshot per DAMASK increment
-        starting from ``increment_1``. Each appended snapshot receives a physical time
-        value taken from ``self._times`` and voxel-level fields extracted from the HDF5.
-
-        In addition, the function writes a top-level JSON key ``"time"`` that stores the
-        list of physical times for all snapshots in ``microstructure`` (including the
-        initial one).
-
-        Parameters
-        ----------
-        json_path : str or pathlib.Path
-            Path to the JSON file to update **in place**. The file must contain a
-            non-empty ``"microstructure"`` list with **exactly one** snapshot at index 0.
-            The snapshot must include:
-            - ``microstructure[0]["grid"]["grid_size"]`` (3 floats)
-            - ``microstructure[0]["grid"]["grid_spacing"]`` (3 floats)
-            - ``microstructure[0]["voxels"]`` list of length ``Nx * Ny * Nz``
-            - each voxel has ``voxel_index = [i, j, k]`` (1-based indexing)
-        quantities : Sequence[str], optional
-            DAMASK dataset keys to export from each increment, e.g.
-            ``("O", "F", "P", "epsilon_V^0.0(F)")``.
-            Only the provided keys are extracted and written to the voxel entries.
-        verbose : bool, optional
-            If True, messages are printed. If False, messages are written via ``logger.info``.
-
-        Returns
-        -------
-        pathlib.Path
-            The path to the updated JSON file (same as ``json_path``).
-
-        """
-
-        def _msg(s: str) -> None:
-            if verbose:
-                print(s)
-            else:
-                logger.info(s)
-
-        INC_PREFIX = "increment_"
-        json_path = Path(json_path)
-
-        if not json_path.exists():
-            raise FileNotFoundError(f"JSON file not found: {json_path}")
-        if not self.fname.exists():
-            raise FileNotFoundError(f"HDF5 file not found: {self.fname}")
-
-        if not self.structured:
-            raise NotImplementedError("export_kanapy is implemented only for structured grids.")
-        if self.N_constituents != 1:
-            raise NotImplementedError(
-                "export_kanapy currently supports only one constituent (N_constituents == 1)."
-            )
-
-        qmap = {
-            "O": "orientation",
-            "F": "deformation_gradient",
-            "F_e": "elastic_deformation_gradient",
-            "F_p": "plastic_deformation_gradient",
-            "IPFcolor_(1 0 0)": "inverse_pole_figure_colors_100",
-            "L_p": "plastic_velocity_gradient",
-            "P": "first_piola_kirchhoff_stress",
-            "epsilon_V^0.0(F)": "strain",
-            "epsilon_V^0.0(F)_vM": "mises_equivalent_strain",
-            "sigma": "stress",
-            "sigma_vM": "mises_equivalent_stress",
-            "xi_sl": "resistance_against_plastic_slip",
-        }
-
-        quantities = list(quantities)
-        unknown = [q for q in quantities if q not in qmap]
-        if unknown:
-            raise KeyError(
-                f"Unknown quantities requested: {unknown}. Allowed: {sorted(qmap.keys())}")
-
-        want_O = "O" in quantities
-        want_F = "F" in quantities
-        wanted_other = [q for q in quantities if q not in ("O", "F")]
-
-        _msg("\n" + "=" * 90)
-        _msg("[INFO] export_kanapy: DAMASK HDF5 -> JSON (append snapshots)")
-        _msg(f"[INFO] JSON: {json_path.resolve()}")
-        _msg(f"[INFO] HDF5: {self.fname.resolve()}")
-        _msg(f"[INFO] Requested quantities: {quantities}")
-        _msg("=" * 90)
-
-        _msg("\n[INFO] Reading JSON...")
-        data_obj = json.loads(json_path.read_text())
-
-        microstructure_series = data_obj.get("microstructure")
-        if not isinstance(microstructure_series, list) or not microstructure_series:
-            raise ValueError(
-                "JSON missing non-empty 'microstructure' list (expected microstructure[0]).")
-
-        if len(microstructure_series) != 1:
-            raise RuntimeError(
-                f"export_kanapy expects exactly ONE snapshot (the initial undeformed state).\n"
-                f"Found {len(microstructure_series)} snapshots instead.\n"
-                f"Please clean/reset the JSON file before running export_kanapy."
-            )
-        _msg("[OK] JSON contains exactly one initial snapshot. Proceeding.")
-
-        base_snapshot = microstructure_series[0]
-
-        grid_meta = base_snapshot.get("grid")
-        if not isinstance(grid_meta, dict):
-            raise ValueError("JSON missing 'microstructure[0].grid' object.")
-
-        grid_status = str(grid_meta.get("status", "unknown")).lower()
-        _msg(f"[INFO] Initial grid status: '{grid_status}'")
-        if grid_status != "undeformed":
-            raise ValueError(
-                f"Expected initial grid status 'regular' (undeformed), got '{grid_status}'.")
-
-        try:
-            grid_size0 = np.asarray(grid_meta["grid_size"], dtype=float)
-            grid_spacing0 = np.asarray(grid_meta["grid_spacing"], dtype=float)
-        except KeyError as e:
-            raise KeyError(
-                "JSON missing 'microstructure[0].grid.grid_size' or 'grid_spacing'.") from e
-
-        cell_counts_f = grid_size0 / grid_spacing0
-        cell_counts = np.rint(cell_counts_f).astype(int)
-        if not np.allclose(cell_counts_f, cell_counts, atol=0, rtol=0):
-            raise ValueError(
-                f"Non-integer voxel counts from grid_size/grid_spacing: {cell_counts_f}")
-
-        Nx, Ny, Nz = map(int, cell_counts.tolist())
-        n_voxels = int(Nx * Ny * Nz)
-
-        voxel_list0 = base_snapshot.get("voxels")
-        if not isinstance(voxel_list0, list) or not voxel_list0:
-            raise ValueError("JSON missing 'microstructure[0].voxels' list.")
-        if len(voxel_list0) != n_voxels:
-            raise ValueError(
-                f"Voxel count mismatch: len(voxels)={len(voxel_list0)} vs Nx*Ny*Nz={n_voxels}")
-
-        _msg("[OK] JSON grid geometry and voxel list are consistent.")
-
-        # phase mapping (compact -> global)
-        at_cell_ph, in_data_ph, _, _ = self._mappings()
-        phases = list(self._phases)
-        _msg(f"[INFO] Phases: {phases}")
-
-        def _inc_index(name: str) -> int:
-            if not name.startswith(INC_PREFIX):
-                raise ValueError(f"Unexpected increment name: {name}")
-            return int(name[len(INC_PREFIX):])
-
-        inc_names = [inc for inc in self._increments if _inc_index(inc) >= 1]
-        _msg(f"[INFO] Appending snapshots: {len(inc_names)} (skip increment_0)")
-
-        def _median_spacing_along_axis(centroids: np.ndarray, axis: int) -> float:
-            if axis == 0:
-                coords = [centroids[(i - 1) + Nx * (0 + Ny * 0), 0] for i in range(1, Nx + 1)]
-            elif axis == 1:
-                coords = [centroids[(0) + Nx * ((j - 1) + Ny * 0), 1] for j in range(1, Ny + 1)]
-            else:
-                coords = [centroids[(0) + Nx * (0 + Ny * (k - 1)), 2] for k in range(1, Nz + 1)]
-            coords = np.sort(np.asarray(coords, float))
-            diffs = np.diff(coords)
-            diffs = diffs[np.isfinite(diffs)]
-            diffs = diffs[diffs > 0]
-            return float(np.median(diffs)) if diffs.size else float("nan")
-
-        with h5py.File(self.fname, "r") as f:
-            for step_idx, inc in enumerate(util.show_progress(inc_names), start=1):
-                inc_idx = _inc_index(inc)  # FIXED
-                t_inc = float(self._times[inc_idx])
-
-                U = np.asarray(f[f"{inc}/geometry/u_p"], float)
-                if U.shape != (n_voxels, 3):
-                    raise ValueError(f"{inc}: geometry/u_p shape {U.shape} != {(n_voxels, 3)}")
-
-                euler_all = np.empty((n_voxels, 3), dtype=float) if want_O else None
-                F_all = np.empty((n_voxels, 3, 3), dtype=float) if want_F else None
-                J_all = np.empty((n_voxels,), dtype=float) if want_F else None
-
-                other_all = {q: None for q in wanted_other}
-
-                for p in phases:
-                    if p not in at_cell_ph[0] or p not in in_data_ph[0]:
-                        raise KeyError(f"Phase '{p}' missing in mapping tables (at_cell/in_data).")
-
-                    at_cell = at_cell_ph[0][p]
-                    in_data = in_data_ph[0][p]
-
-                    if want_O:
-                        path_O = f"{inc}/phase/{p}/mechanical/O"
-                        if path_O not in f:
-                            raise KeyError(f"Missing dataset '{path_O}'")
-                        O_compact = np.asarray(f[path_O], float)
-                        if O_compact.ndim != 2 or O_compact.shape[1] != 4:
-                            raise ValueError(
-                                f"{path_O}: expected (n,4) quaternion array, got {O_compact.shape}")
-                        euler_all[at_cell, :] = (
-                            damask.Rotation.from_quaternion(O_compact[in_data, :]).as_Euler_angles(
-                                degrees=False)
-                        )
-
-                    if want_F:
-                        path_F = f"{inc}/phase/{p}/mechanical/F"
-                        if path_F not in f:
-                            raise KeyError(f"Missing dataset '{path_F}'")
-                        F_compact = np.asarray(f[path_F], float)
-                        F_all[at_cell, :, :] = F_compact[in_data, :, :]
-                        J_all[at_cell] = np.linalg.det(F_compact[in_data, :, :])
-
-                    for q in wanted_other:
-                        path_q = f"{inc}/phase/{p}/mechanical/{q}"
-                        if path_q not in f:
-                            raise KeyError(f"Missing dataset '{path_q}'")
-                        q_compact = np.asarray(f[path_q], float)
-                        q_phase = q_compact[in_data, ...]
-                        if other_all[q] is None:
-                            other_all[q] = np.empty((n_voxels,) + q_phase.shape[1:], dtype=float)
-                        other_all[q][at_cell, ...] = q_phase
-
-                snap = copy.deepcopy(base_snapshot)
-                snap["time"] = t_inc
-                snap.setdefault("grid", {})
-                snap["grid"]["status"] = "deformed"
-
-                voxels = snap["voxels"]
-                centroids = np.empty((n_voxels, 3), dtype=float)
-
-                for v in voxels:
-                    i, j, k = v["voxel_index"]
-                    L = (i - 1) + Nx * ((j - 1) + Ny * (k - 1))
-
-                    c0 = np.asarray(v.get("centroid_coordinates", [0.0, 0.0, 0.0]), float)
-                    c_def = c0 + U[L]
-                    v["centroid_coordinates"] = c_def.tolist()
-                    centroids[L, :] = c_def
-
-                    if want_O:
-                        v[qmap["O"]] = euler_all[L].tolist()
-                    if want_F:
-                        v[qmap["F"]] = F_all[L].tolist()
-                        V0 = float(v.get("voxel_volume", 0.0))
-                        J_L = float(J_all[L])
-                        if J_L < 0 and J_L > -1e-10:
-                            J_L = 0.0
-                        v["voxel_volume"] = V0 * J_L
-
-                    for q in wanted_other:
-                        v[qmap[q]] = np.asarray(other_all[q][L, ...]).tolist()
-
-                cmin = centroids.min(axis=0)
-                cmax = centroids.max(axis=0)
-                grid_size_def = (cmax - cmin)
-
-                dx = _median_spacing_along_axis(centroids, 0)
-                dy = _median_spacing_along_axis(centroids, 1)
-                dz = _median_spacing_along_axis(centroids, 2)
-                grid_spacing_def = np.array([dx, dy, dz], float)
-
-                if np.any(~np.isfinite(grid_spacing_def)):
-                    raise ValueError(
-                        f"{inc}: grid_spacing estimate produced NaN/inf: {grid_spacing_def}")
-
-                snap["grid"]["grid_size"] = grid_size_def.tolist()
-                snap["grid"]["grid_spacing"] = grid_spacing_def.tolist()
-
-                microstructure_series.append(snap)
-
-                if step_idx in (1, 2) or step_idx == len(inc_names) or (step_idx % 20 == 0):
-                    _msg(
-                        f"[INFO] {inc:>12} | t={t_inc:.6g} | grid_size={grid_size_def} | grid_spacing={grid_spacing_def}")
-
-        # Store global physical time axis (derived from DAMASK Result)
-        data_obj["time"] = [
-            float(self._times[i])
-            for i in sorted(self._times.keys())]
-
-        # WRITE + RETURN OUTSIDE LOOP (FIXED)
-        _msg(f"[INFO] Writing updated JSON back to: {json_path.resolve()}")
-        json_path.write_text(json.dumps(data_obj, indent=2))
-        _msg("[DONE] export_kanapy finished.")
-        _msg("=" * 90)
-        return json_path
 
     def export_DADF5(self,
                      fname,
